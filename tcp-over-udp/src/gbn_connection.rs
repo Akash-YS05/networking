@@ -685,50 +685,126 @@ async fn event_loop(
     mut app_rx: mpsc::Receiver<Vec<u8>>,
     app_tx: mpsc::Sender<Result<Vec<u8>, ConnError>>,
 ) {
-    // Use the estimator's current RTO as the timer interval.
     let mut rto = rtt.rto();
     let mut retries = 0u32;
 
-    // The retransmit timer: "disarmed" means we reset it to a far-future
-    // deadline.  The `timer_armed` guard prevents acting on a disarmed timer.
     let far_future = Duration::from_secs(365 * 24 * 3600);
     let timer = tokio::time::sleep(far_future);
     tokio::pin!(timer);
     let mut timer_armed = false;
-    // `half_closed` is set when the application drops `send_tx`.  After
-    // sending our FIN we must keep the loop alive to receive — and ACK —
-    // the peer's FIN before exiting.
+
+    // One-slot staging buffer: holds a segment taken from app_rx when the
+    // send window was shut.  Cleared by the drain phase each iteration.
+    let mut staged: Option<Vec<u8>> = None;
+
+    // `fin_pending` becomes true as soon as app_rx returns None (send_tx
+    // dropped).  The actual FIN wire packet is sent by the drain phase once
+    // the staging slot is empty and all in-flight data is acknowledged.
+    let mut fin_pending = false;
+
+    // `half_closed` is set after we have transmitted our FIN.  The loop
+    // stays alive so Branch 2 can receive and ACK the peer's FIN.
     let mut half_closed = false;
 
     loop {
+        // ── Drain phase ────────────────────────────────────────────────────
+        //
+        // Run at the top of every iteration so that progress made by any
+        // branch (ACK opening the window, timer probe) is acted upon
+        // immediately without an extra round-trip through select!.
+
+        // 1. Try to send the staged segment if the window has opened.
+        if let Some(data) = staged.take() {
+            if sender.can_send() {
+                let pkt = sender.build_data_packet(
+                    data,
+                    receiver.ack_number(),
+                    receiver.window_size(),
+                );
+                if socket.send_to(&pkt, peer).await.is_err() {
+                    break;
+                }
+                sender.record_sent(pkt);
+                retries = 0;
+                if !timer_armed {
+                    timer.as_mut().reset(tok_now() + rto);
+                    timer_armed = true;
+                }
+                log::debug!("[gbn:loop] staged → DATA in_flight={}", sender.in_flight());
+            } else {
+                // Window still shut — put the segment back and ensure the
+                // retransmit timer is armed so Branch 3 can probe.
+                staged = Some(data);
+                if !timer_armed {
+                    timer.as_mut().reset(tok_now() + rto);
+                    timer_armed = true;
+                }
+            }
+        }
+
+        // 2. Send our FIN once: app closed + staging slot empty + window drained.
+        //    Decoupling FIN from can_send() is the whole point of this
+        //    restructure: FIN is a lifecycle event, not a data segment.
+        if fin_pending && !half_closed && staged.is_none() && !sender.has_unacked() {
+            let fin = build_fin(&sender, &receiver);
+            let _ = socket.send_to(&fin, peer).await;
+            log::debug!("[gbn:loop] → FIN (data drained); waiting for peer FIN");
+            half_closed = true;
+        }
+
+        // ── Event wait ─────────────────────────────────────────────────────
         tokio::select! {
-            // ── Branch 1: new data from the application ───────────────────
-            maybe_data = app_rx.recv(), if sender.can_send() && !half_closed => {
-                match maybe_data {
-                    None => {
-                        // App closed send_tx → send FIN, then stay in the
-                        // loop so Branch 2 can receive and ACK the peer's FIN.
-                        let fin = build_fin(&sender, &receiver);
-                        let _ = socket.send_to(&fin, peer).await;
-                        log::debug!("[gbn:loop] → FIN (app closed); waiting for peer FIN");
-                        half_closed = true;
-                    }
+            // ── Branch 1: application data or channel close ───────────────
+            //
+            // Guard: lifecycle conditions ONLY — sender.can_send() is
+            // intentionally absent.  The channel must always be observable so
+            // that None (send_tx dropped) is never hidden by window state.
+            //
+            // The one-slot `staged` buffer prevents consuming items faster
+            // than they can be dispatched while still allowing None to be
+            // seen the moment the slot is free.
+            msg = app_rx.recv(), if staged.is_none() && !fin_pending && !half_closed => {
+                match msg {
                     Some(payload) => {
-                        let pkt = sender.build_data_packet(
-                            payload,
-                            receiver.ack_number(),
-                            receiver.window_size(),
+                        if sender.can_send() {
+                            // Fast path: window open — send immediately.
+                            let pkt = sender.build_data_packet(
+                                payload,
+                                receiver.ack_number(),
+                                receiver.window_size(),
+                            );
+                            if socket.send_to(&pkt, peer).await.is_err() {
+                                break;
+                            }
+                            sender.record_sent(pkt);
+                            retries = 0;
+                            if !timer_armed {
+                                timer.as_mut().reset(tok_now() + rto);
+                                timer_armed = true;
+                            }
+                            log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
+                        } else {
+                            // Slow path: window shut — park the segment.
+                            // The drain phase will send it once an ACK opens
+                            // the window; the timer ensures we probe if stalled.
+                            staged = Some(payload);
+                            if !timer_armed {
+                                timer.as_mut().reset(tok_now() + rto);
+                                timer_armed = true;
+                            }
+                        }
+                    }
+                    None => {
+                        // send_tx dropped.  Queue the FIN; the drain phase at
+                        // the top of the next iteration will emit it once all
+                        // in-flight data has been acknowledged.
+                        fin_pending = true;
+                        log::debug!(
+                            "[gbn:loop] app closed; FIN pending \
+                             (in_flight={} staged={})",
+                            sender.in_flight(),
+                            staged.is_some()
                         );
-                        if socket.send_to(&pkt, peer).await.is_err() {
-                            break;
-                        }
-                        sender.record_sent(pkt);
-                        retries = 0;
-                        if !timer_armed {
-                            timer.as_mut().reset(tok_now() + rto);
-                            timer_armed = true;
-                        }
-                        log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
                     }
                 }
             }
@@ -762,7 +838,6 @@ async fn event_loop(
                 // Cumulative ACK — slide window, update peer rwnd, RTT estimator, Reno CC.
                 if h.flags & flags::ACK != 0 {
                     let AckResult { acked_count, rtt_sample, dup_ack } = sender.on_ack(h.ack);
-                    // Update peer's advertised receive window on every ACK.
                     sender.update_peer_rwnd(h.window);
                     if let Some(sample) = rtt_sample {
                         rtt.record_sample(sample);
@@ -787,6 +862,8 @@ async fn event_loop(
                             timer_armed = false;
                             timer.as_mut().reset(tok_now() + far_future);
                         }
+                        // The drain phase at the top of the next iteration will
+                        // send any staged segment and/or emit FIN if warranted.
                     } else if dup_ack && sender.dup_ack_count() == 3 {
                         // Reno fast retransmit: retransmit oldest unacked segment.
                         sender.on_triple_dup_ack_cc();
@@ -834,6 +911,12 @@ async fn event_loop(
                     if let Some(pkt) = sender.window_entries().next().map(|e| e.packet.clone()) {
                         log::debug!("[gbn:loop] zero-window probe seq={}", pkt.header.seq);
                         let _ = socket.send_to(&pkt, peer).await;
+                    } else {
+                        // No in-flight segments (e.g. staged data waiting for
+                        // rwnd > 0): send a pure ACK to elicit a window update.
+                        let ack = build_ack(&sender, &receiver);
+                        log::debug!("[gbn:loop] zero-window keepalive (no in-flight)");
+                        let _ = socket.send_to(&ack, peer).await;
                     }
                     rto = (rto * 2).min(Duration::from_secs(64));
                     log::debug!("[gbn:loop] zero-window probe — rto={:?}", rto);
@@ -844,10 +927,7 @@ async fn event_loop(
                         let _ = socket.send_to(&pkt, peer).await;
                     }
 
-                    // Reno: halve ssthresh, reset cwnd to 1, re-enter slow start.
                     sender.on_timeout_cc();
-
-                    // Exponential back-off via the RTT estimator.
                     rtt.back_off();
                     rto = rtt.rto();
                     log::debug!(

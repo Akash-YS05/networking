@@ -223,6 +223,93 @@ async fn test_gbn_concurrent_session() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 4b: concurrent session — no deadlock when window is full at close
+//
+// Regression test for the bug where `sender.can_send()` was part of Branch 1's
+// select! guard.  When the send window was full (can_send() == false), the
+// branch was disabled and the None produced by dropping send_tx was never
+// observed, so FIN was never emitted and the event loop blocked forever.
+//
+// Failure mode: the `tokio::time::timeout` fires, indicating the session
+// never reached CLOSED within the allowed window.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_no_deadlock_window_full_at_close() {
+    // Large enough window that several segments are in-flight simultaneously,
+    // making it likely (near-certain on loopback) that can_send() == false
+    // when send_tx is dropped.
+    const WINDOW: usize = 4;
+
+    // More messages than WINDOW so the send channel still holds items when
+    // the window fills.  The event loop will reach can_send() == false while
+    // there are still payloads queued — the exact state that caused the bug.
+    const MSG_COUNT: usize = WINDOW * 3;
+
+    // Fail fast: if either side stalls, the test must not hang for minutes.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    // Server: drain every message (ACKs are implicit) and close.
+    // Deliberately does NOT echo back — the client's event loop has no
+    // inbound data to process, so any stall is purely on the FIN path.
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+        loop {
+            match conn.recv().await {
+                Ok(_payload) => { /* ACK sent automatically; payload discarded */ }
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        conn.close().await.expect("server close");
+    });
+
+    // Client: queue more messages than the window in one burst (non-blocking
+    // because the mpsc channel capacity >> MSG_COUNT), then drop send_tx
+    // immediately.  The event loop will have can_send() == false for at
+    // least part of this burst, which is the regression trigger.
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        let session = conn.run();
+
+        for i in 0..MSG_COUNT {
+            session
+                .send(format!("fill-{i}").into_bytes())
+                .await
+                .expect("send");
+        }
+
+        // Dropping send_tx here is the critical moment.  The event loop must
+        // observe None and eventually emit FIN even if can_send() == false.
+        session.close().await;
+    });
+
+    // Both tasks must finish within DEADLINE; if either stalls, a deadlock
+    // has occurred and we want an immediate, informative failure.
+    tokio::time::timeout(DEADLINE, async {
+        let (sr, cr) = tokio::join!(server, client);
+        sr.expect("server task panicked");
+        cr.expect("client task panicked");
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "deadlock: concurrent session did not reach CLOSED within {DEADLINE:?}\n\
+             (window was full when send_tx was dropped — FIN was never emitted)"
+        )
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Test 5: GBN sender unit-level — window boundary
 // ---------------------------------------------------------------------------
 
