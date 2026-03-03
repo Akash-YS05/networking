@@ -70,6 +70,19 @@ use crate::state::ConnectionState;
 
 const MAX_RETRIES: u32 = 6;
 
+/// Default Maximum Segment Lifetime used for `TIME_WAIT` (2 × MSL total).
+///
+/// Defaults to zero so that connections behave correctly in tests and demos
+/// without any linger delay.  Callers that want real TIME_WAIT protection
+/// call `.with_msl(Duration::from_secs(30))` (or similar) before `close()`
+/// or `run()`.  Note: `#[cfg(test)]` inside a library crate is **not** set
+/// for integration tests in `tests/`, so we cannot use it here.
+const DEFAULT_MSL: Duration = Duration::ZERO;
+
+/// Maximum time we linger in `FIN_WAIT_2` waiting for the peer's FIN.
+/// (Linux uses 60 s; we match that.)
+const FIN_WAIT_2_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // GbnConnection
 // ---------------------------------------------------------------------------
@@ -99,6 +112,12 @@ pub struct GbnConnection {
 
     /// Remote peer address.
     peer: SocketAddr,
+
+    /// Maximum Segment Lifetime used for the `TIME_WAIT` timer (2 × MSL total).
+    /// Override with [`with_msl`] before calling `close()` or `run()`.
+    ///
+    /// [`with_msl`]: Self::with_msl
+    msl: Duration,
 }
 
 impl GbnConnection {
@@ -139,6 +158,7 @@ impl GbnConnection {
             sender: GbnSender::new(next_seq, window_size),
             receiver: GbnReceiver::with_capacity(rcv_nxt, recv_buf_bytes),
             rtt: RttEstimator::new(),
+            msl: DEFAULT_MSL,
         }
     }
 
@@ -185,6 +205,20 @@ impl GbnConnection {
     ) -> Result<Self, ConnError> {
         let conn = Connection::accept(socket).await?;
         Ok(Self::from_connection_with_recv_buf(conn, window_size, recv_buf_bytes))
+    }
+
+    /// Override the Maximum Segment Lifetime used for `TIME_WAIT`.
+    ///
+    /// The connection lingers in `TIME_WAIT` for `2 × msl` after the active
+    /// close completes, absorbing stale segments that might otherwise corrupt a
+    /// subsequent connection on the same port.
+    ///
+    /// ```ignore
+    /// let conn = GbnConnection::connect(sock, peer, 4).await?.with_msl(Duration::from_secs(30));
+    /// ```
+    pub fn with_msl(mut self, msl: Duration) -> Self {
+        self.msl = msl;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -393,20 +427,42 @@ impl GbnConnection {
         Ok(())
     }
 
-    /// Graceful close: flush pending data, then exchange FIN/ACK.
+    /// Graceful close: flush pending data, then perform the full TCP teardown.
+    ///
+    /// # State machine
+    ///
+    /// **Active closer** (called from `Established`):
+    /// ```text
+    /// Established → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT (2×MSL) → Closed
+    /// ```
+    /// A combined FIN+ACK from the peer collapses FIN_WAIT_1 + FIN_WAIT_2 into
+    /// a direct transition to TIME_WAIT.  A simultaneous FIN takes the Closing
+    /// path (RFC 793 §3.5).
+    ///
+    /// **Passive closer** (called from `CloseWait`, after `recv()` returned `Eof`):
+    /// ```text
+    /// CloseWait → LAST_ACK → Closed   (no TIME_WAIT)
+    /// ```
     pub async fn close(&mut self) -> Result<(), ConnError> {
         if matches!(self.state, ConnectionState::Closed) {
             return Ok(());
         }
 
+        // Passive-close path: peer already sent FIN; we just need to send ours.
+        if matches!(self.state, ConnectionState::CloseWait) {
+            return self.close_passive().await;
+        }
+
+        // Active-close path (state == Established).
         match self.flush().await {
             Ok(()) | Err(ConnError::Eof) => {}
             Err(e) => return Err(e),
         }
 
+        let fin_seq = self.sender.next_seq;
         let fin = Packet {
             header: Header {
-                seq: self.sender.next_seq,
+                seq: fin_seq,
                 ack: self.receiver.ack_number(),
                 flags: flags::FIN | flags::ACK,
                 window: self.receiver.window_size(),
@@ -416,22 +472,56 @@ impl GbnConnection {
         };
         let mut rto = self.rtt.rto();
 
-        for _attempt in 0..=MAX_RETRIES {
+        // ── Phase 1: FIN_WAIT_1 ────────────────────────────────────────────
+        // Transmit our FIN and wait for a reply.  Three outcomes:
+        //   a) ACK covers our FIN → FIN_WAIT_2
+        //   b) FIN+ACK (combined) → TIME_WAIT directly
+        //   c) FIN only (simultaneous close) → Closing
+        let mut fin_acked = false;
+        'fw1: for _attempt in 0..=MAX_RETRIES {
             self.socket.send_to(&fin, self.peer).await?;
             self.state = ConnectionState::FinWait1;
-            log::debug!("[gbn] → FIN seq={}", fin.header.seq);
+            log::debug!("[gbn] active close → FIN_WAIT_1; → FIN seq={}", fin_seq);
 
             match timeout(rto, self.socket.recv_from()).await {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
-                    if pkt.header.flags & flags::ACK != 0
-                        && pkt.header.ack == fin.header.seq.wrapping_add(1)
-                    {
-                        log::debug!("[gbn] ← ACK of FIN — closed");
+                    let h = &pkt.header;
+                    let acks_our_fin = h.flags & flags::ACK != 0
+                        && h.ack == fin_seq.wrapping_add(1);
+                    let has_fin = h.flags & flags::FIN != 0;
+
+                    if acks_our_fin && has_fin {
+                        // FIN+ACK: peer closed simultaneously with ACKing ours.
+                        // → TIME_WAIT directly (skip FIN_WAIT_2).
+                        self.receiver.on_fin(h.seq);
+                        let ack = self.make_ack_pkt();
+                        let _ = self.socket.send_to(&ack, self.peer).await;
+                        log::debug!("[gbn] FIN_WAIT_1 ← FIN+ACK → TIME_WAIT");
+                        self.state = ConnectionState::TimeWait;
+                        self.do_time_wait(ack).await;
                         self.state = ConnectionState::Closed;
                         return Ok(());
                     }
+
+                    if acks_our_fin {
+                        // Normal path: our FIN was ACKed; wait for peer's FIN.
+                        log::debug!("[gbn] FIN_WAIT_1 ← ACK of FIN → FIN_WAIT_2");
+                        self.state = ConnectionState::FinWait2;
+                        fin_acked = true;
+                        break 'fw1;
+                    }
+
+                    if has_fin {
+                        // Simultaneous close: peer sent FIN before ACKing ours.
+                        self.receiver.on_fin(h.seq);
+                        let ack = self.make_ack_pkt();
+                        let _ = self.socket.send_to(&ack, self.peer).await;
+                        log::debug!("[gbn] FIN_WAIT_1 ← simultaneous FIN → CLOSING");
+                        self.state = ConnectionState::Closing;
+                        return self.close_from_closing(fin_seq, rto).await;
+                    }
                 }
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => {} // wrong peer or unexpected packet
                 Ok(Err(e)) => return Err(ConnError::Socket(e)),
                 Err(_elapsed) => {
                     self.rtt.back_off();
@@ -440,7 +530,28 @@ impl GbnConnection {
             }
         }
 
-        log::warn!("[gbn] FIN not ACKed; force-closing");
+        if !fin_acked {
+            log::warn!("[gbn] FIN not ACKed after {} retries; force-closing", MAX_RETRIES);
+            self.state = ConnectionState::Closed;
+            return Ok(());
+        }
+
+        // ── Phase 2: FIN_WAIT_2 ────────────────────────────────────────────
+        // Wait for the peer's FIN.  A 60 s deadline guards against a peer that
+        // never sends its FIN (e.g. crashed after ACKing ours).
+        let last_ack = match timeout(FIN_WAIT_2_TIMEOUT, self.recv_peer_fin_in_fw2()).await {
+            Ok(Ok(ack)) => ack,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                log::warn!("[gbn] FIN_WAIT_2 timed out; force-closing");
+                self.state = ConnectionState::Closed;
+                return Ok(());
+            }
+        };
+
+        // ── Phase 3: TIME_WAIT ─────────────────────────────────────────────
+        self.state = ConnectionState::TimeWait;
+        self.do_time_wait(last_ack).await;
         self.state = ConnectionState::Closed;
         Ok(())
     }
@@ -465,6 +576,7 @@ impl GbnConnection {
             self.rtt,
             send_rx,
             recv_tx,
+            self.msl,
         ));
 
         GbnSession {
@@ -637,6 +749,161 @@ impl GbnConnection {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Active-close helpers
+    // -----------------------------------------------------------------------
+
+    /// Passive-close path (entry state = `CloseWait`): send our FIN and wait
+    /// for the peer to ACK it.  No TIME_WAIT — the passive closer goes directly
+    /// to `Closed` per RFC 793.
+    async fn close_passive(&mut self) -> Result<(), ConnError> {
+        let fin = Packet {
+            header: Header {
+                seq: self.sender.next_seq,
+                ack: self.receiver.ack_number(),
+                flags: flags::FIN | flags::ACK,
+                window: self.receiver.window_size(),
+                checksum: 0,
+            },
+            payload: vec![],
+        };
+        let fin_seq = fin.header.seq;
+        let mut rto = self.rtt.rto();
+        self.state = ConnectionState::LastAck;
+        log::debug!("[gbn] passive close → LAST_ACK; → FIN seq={}", fin_seq);
+
+        for _attempt in 0..=MAX_RETRIES {
+            self.socket.send_to(&fin, self.peer).await?;
+
+            match timeout(rto, self.socket.recv_from()).await {
+                Ok(Ok((pkt, addr))) if addr == self.peer => {
+                    if pkt.header.flags & flags::ACK != 0
+                        && pkt.header.ack == fin_seq.wrapping_add(1)
+                    {
+                        log::debug!("[gbn] passive close ← ACK of FIN → CLOSED");
+                        self.state = ConnectionState::Closed;
+                        return Ok(());
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(ConnError::Socket(e)),
+                Err(_elapsed) => {
+                    self.rtt.back_off();
+                    rto = self.rtt.rto();
+                }
+            }
+        }
+
+        log::warn!("[gbn] passive close: FIN not ACKed; force-closing");
+        self.state = ConnectionState::Closed;
+        Ok(())
+    }
+
+    /// `FIN_WAIT_2`: consume incoming packets until the peer sends its FIN.
+    ///
+    /// Stray ACKs and data segments are processed normally (updating the RTT
+    /// estimator and ACKing data) so that the peer can finish flushing.  Returns
+    /// the ACK packet we sent in response to the peer's FIN; that packet becomes
+    /// `last_ack` for the subsequent `TIME_WAIT` phase.
+    async fn recv_peer_fin_in_fw2(&mut self) -> Result<Packet, ConnError> {
+        loop {
+            let (pkt, addr) = self.socket.recv_from().await?;
+            if addr != self.peer {
+                continue;
+            }
+            let h = &pkt.header;
+
+            if h.flags & flags::FIN != 0 {
+                self.receiver.on_fin(h.seq);
+                let ack = self.make_ack_pkt();
+                let _ = self.socket.send_to(&ack, self.peer).await;
+                log::debug!(
+                    "[gbn] FIN_WAIT_2 ← FIN seq={} → ACK ack={} → TIME_WAIT",
+                    h.seq,
+                    self.receiver.ack_number()
+                );
+                return Ok(ack);
+            }
+
+            // Piggybacked ACK or stray cumulative ACK.
+            if h.flags & flags::ACK != 0 {
+                self.on_ack_received(h.ack, h.window);
+            }
+
+            // Data segment: the peer might still be sending before it closes.
+            if !pkt.payload.is_empty() {
+                self.receiver.on_segment(h.seq, &pkt.payload);
+                let ack = self.make_ack_pkt();
+                let _ = self.socket.send_to(&ack, self.peer).await;
+            }
+        }
+    }
+
+    /// `TIME_WAIT`: linger for 2×MSL, absorbing any stale or duplicate packets.
+    ///
+    /// - Duplicate FINs are re-ACKed using `last_ack` (the packet already sent).
+    /// - All other segments are silently discarded.
+    /// - `biased` polling ensures the timer fires on schedule even under packet
+    ///   storms; TIME_WAIT cannot be extended by incoming traffic.
+    async fn do_time_wait(&self, last_ack: Packet) {
+        let two_msl = 2 * self.msl;
+        let timer = tokio::time::sleep(two_msl);
+        tokio::pin!(timer);
+        log::debug!("[gbn] TIME_WAIT start; 2×MSL={:?}", two_msl);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut timer => {
+                    log::debug!("[gbn] TIME_WAIT expired → CLOSED");
+                    break;
+                }
+                result = self.socket.recv_from() => {
+                    if let Ok((pkt, addr)) = result {
+                        if addr == self.peer && pkt.header.flags & flags::FIN != 0 {
+                            log::debug!("[gbn] TIME_WAIT: re-ACK duplicate FIN");
+                            let _ = self.socket.send_to(&last_ack, self.peer).await;
+                        }
+                        // All other segments: silently discard.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Simultaneous-close path (entry state = `Closing`): wait for the peer's
+    /// ACK of our FIN, then enter TIME_WAIT.
+    async fn close_from_closing(&mut self, fin_seq: u32, mut rto: Duration) -> Result<(), ConnError> {
+        log::debug!("[gbn] simultaneous close → CLOSING; waiting for ACK of our FIN");
+
+        for _attempt in 0..=MAX_RETRIES {
+            match timeout(rto, self.socket.recv_from()).await {
+                Ok(Ok((pkt, addr))) if addr == self.peer => {
+                    if pkt.header.flags & flags::ACK != 0
+                        && pkt.header.ack == fin_seq.wrapping_add(1)
+                    {
+                        log::debug!("[gbn] CLOSING ← ACK of FIN → TIME_WAIT");
+                        self.state = ConnectionState::TimeWait;
+                        let ack = self.make_ack_pkt();
+                        self.do_time_wait(ack).await;
+                        self.state = ConnectionState::Closed;
+                        return Ok(());
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(ConnError::Socket(e)),
+                Err(_elapsed) => {
+                    self.rtt.back_off();
+                    rto = self.rtt.rto();
+                }
+            }
+        }
+
+        log::warn!("[gbn] CLOSING: ACK of FIN not received; force-closing");
+        self.state = ConnectionState::Closed;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +951,7 @@ async fn event_loop(
     mut rtt: RttEstimator,
     mut app_rx: mpsc::Receiver<Vec<u8>>,
     app_tx: mpsc::Sender<Result<Vec<u8>, ConnError>>,
+    msl: Duration,
 ) {
     let mut rto = rtt.rto();
     let mut retries = 0u32;
@@ -705,6 +973,14 @@ async fn event_loop(
     // `half_closed` is set after we have transmitted our FIN.  The loop
     // stays alive so Branch 2 can receive and ACK the peer's FIN.
     let mut half_closed = false;
+
+    // Sequence number of our FIN packet; set when `half_closed` fires.
+    // Used to detect the ACK that covers our FIN (FIN_WAIT_1 → FIN_WAIT_2).
+    let mut fin_seq: u32 = 0;
+
+    // Set once the peer ACKs our FIN; we then know we are in FIN_WAIT_2.
+    #[allow(unused_variables)]
+    let mut fin_acked = false;
 
     loop {
         // ── Drain phase ────────────────────────────────────────────────────
@@ -747,8 +1023,9 @@ async fn event_loop(
         //    restructure: FIN is a lifecycle event, not a data segment.
         if fin_pending && !half_closed && staged.is_none() && !sender.has_unacked() {
             let fin = build_fin(&sender, &receiver);
+            fin_seq = fin.header.seq;  // Save for ACK-of-FIN detection below.
             let _ = socket.send_to(&fin, peer).await;
-            log::debug!("[gbn:loop] → FIN (data drained); waiting for peer FIN");
+            log::debug!("[gbn:loop] → FIN seq={} (data drained); waiting for peer FIN", fin_seq);
             half_closed = true;
         }
 
@@ -830,14 +1107,28 @@ async fn event_loop(
                     receiver.on_fin(h.seq);
                     let ack = build_ack(&sender, &receiver);
                     let _ = socket.send_to(&ack, peer).await;
-                    let _ = app_tx.send(Err(ConnError::Eof)).await;
-                    log::debug!("[gbn:loop] ← FIN; → ACK");
+                    if half_closed {
+                        // Active closer: our FIN was already sent; peer confirmed
+                        // by closing its side.  Enter TIME_WAIT for 2×MSL.
+                        log::debug!("[gbn:loop] ← FIN (active close) → TIME_WAIT; ACK sent");
+                        run_time_wait(&socket, peer, ack, msl).await;
+                        log::debug!("[gbn:loop] TIME_WAIT expired → CLOSED");
+                    } else {
+                        // Passive closer: peer initiated close; notify the app.
+                        let _ = app_tx.send(Err(ConnError::Eof)).await;
+                        log::debug!("[gbn:loop] ← FIN (passive close); ACK sent → Eof");
+                    }
                     break;
                 }
 
                 // Cumulative ACK — slide window, update peer rwnd, RTT estimator, Reno CC.
                 if h.flags & flags::ACK != 0 {
                     let AckResult { acked_count, rtt_sample, dup_ack } = sender.on_ack(h.ack);
+                    // Track whether the peer has ACKed our FIN (FIN_WAIT_1 → FIN_WAIT_2).
+                    if half_closed && !fin_acked && h.ack == fin_seq.wrapping_add(1) {
+                        fin_acked = true;
+                        log::debug!("[gbn:loop] ← ACK of our FIN → FIN_WAIT_2");
+                    }
                     sender.update_peer_rwnd(h.window);
                     if let Some(sample) = rtt_sample {
                         rtt.record_sample(sample);
@@ -936,6 +1227,46 @@ async fn event_loop(
                     );
                 }
                 timer.as_mut().reset(tok_now() + rto);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TIME_WAIT (concurrent mode)
+// ---------------------------------------------------------------------------
+
+/// Linger in `TIME_WAIT` for `2 × msl`, re-ACKing duplicate FINs.
+///
+/// Called from the event loop after the active-close FIN exchange completes.
+/// `last_ack` is the ACK we sent in response to the peer's FIN; it is resent
+/// verbatim for each duplicate FIN without re-invoking `on_fin`.
+///
+/// `biased` polling gives the timer priority so that an adversarial FIN flood
+/// cannot prevent the connection from ever reaching `Closed`.
+async fn run_time_wait(
+    socket: &Arc<Socket>,
+    peer: SocketAddr,
+    last_ack: Packet,
+    msl: Duration,
+) {
+    let two_msl = 2 * msl;
+    let timer = tokio::time::sleep(two_msl);
+    tokio::pin!(timer);
+    log::debug!("[gbn:loop] TIME_WAIT start; 2×MSL={:?}", two_msl);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut timer => break,
+            result = socket.recv_from() => {
+                if let Ok((pkt, addr)) = result {
+                    if addr == peer && pkt.header.flags & flags::FIN != 0 {
+                        log::debug!("[gbn:loop] TIME_WAIT: re-ACK duplicate FIN");
+                        let _ = socket.send_to(&last_ack, peer).await;
+                    }
+                    // All other segments: silently discard.
+                }
             }
         }
     }

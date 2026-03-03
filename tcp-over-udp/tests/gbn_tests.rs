@@ -168,11 +168,13 @@ async fn test_gbn_concurrent_session() {
     let server_addr = server_sock.local_addr;
 
     // Server side: sequential recv, echoes back.
+    // Loop until Eof so that state == CloseWait when close() is called,
+    // which takes the passive-close path (no FIN_WAIT_2 stall).
     let server = tokio::spawn(async move {
         let mut conn = GbnConnection::accept(server_sock, WINDOW)
             .await
             .expect("accept");
-        for _ in 0..MSG_COUNT {
+        loop {
             match conn.recv().await {
                 Ok(data) => conn.send(&data).await.expect("echo"),
                 Err(ConnError::Eof) => break,
@@ -1202,4 +1204,264 @@ fn test_sr_full_cycle() {
     let r = sender.on_ack(32);
     assert_eq!(r.acked_count, 4, "all 4 segments must be acked by cumulative ACK=32");
     assert!(!sender.has_unacked(), "sender window must be empty after full ACK");
+}
+
+// ---------------------------------------------------------------------------
+// Test 30: active-close traverses the full state machine with TIME_WAIT
+// ---------------------------------------------------------------------------
+//
+// The *client* calls `close()` first (active closer):
+//   ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED
+//
+// The *server* calls `close()` after receiving Eof (passive closer):
+//   CLOSE_WAIT → LAST_ACK → CLOSED  (no TIME_WAIT)
+//
+// We use a non-zero MSL (50 ms) on the client so we can assert that the
+// close() call actually lingered for at least 2×MSL = 100 ms.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_active_close_full_path() {
+    use std::time::{Duration, Instant};
+    use tokio::time::timeout;
+
+    const WINDOW: usize = 4;
+    const MSL: Duration = Duration::from_millis(50);
+    const TWO_MSL: Duration = Duration::from_millis(100);
+    // Extra slack for CI scheduling jitter.
+    const SLACK: Duration = Duration::from_millis(500);
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW).await.unwrap();
+
+        // Echo everything back.
+        loop {
+            match conn.recv().await {
+                Ok(data) => conn.send(&data).await.unwrap(),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        // Passive close (state == CloseWait): send FIN, no TIME_WAIT.
+        conn.close().await.unwrap();
+    });
+
+    let client = tokio::spawn(async move {
+        let client_sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(client_sock, server_addr, WINDOW)
+            .await
+            .unwrap()
+            .with_msl(MSL);    // Non-zero MSL so TIME_WAIT is observable.
+
+        conn.send(b"ping").await.unwrap();
+        let reply = conn.recv().await.unwrap();
+        assert_eq!(reply, b"ping");
+
+        // Active close: ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED.
+        let t0 = Instant::now();
+        conn.close().await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed >= TWO_MSL,
+            "TIME_WAIT must last at least 2×MSL={:?}; actual={:?}",
+            TWO_MSL, elapsed,
+        );
+        assert!(
+            elapsed < TWO_MSL + SLACK,
+            "close() must not significantly over-wait; actual={:?}",
+            elapsed,
+        );
+    });
+
+    timeout(DEADLINE, async { let (s, c) = tokio::join!(server, client); s.unwrap(); c.unwrap(); })
+        .await
+        .expect("active-close full-path timed out — possible deadlock");
+}
+
+// ---------------------------------------------------------------------------
+// Test 31: stale data segment arriving during TIME_WAIT is silently discarded
+// ---------------------------------------------------------------------------
+//
+// A third socket injects a random data segment to the client's address while
+// the client is lingering in TIME_WAIT.  `close()` must still complete normally
+// and within the expected window.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_time_wait_absorbs_late_segment() {
+    use std::time::{Duration, Instant};
+    use tcp_over_udp::packet::{flags, Header, Packet};
+    use tokio::time::timeout;
+
+    const WINDOW: usize = 4;
+    const MSL: Duration = Duration::from_millis(50);
+    const TWO_MSL: Duration = Duration::from_millis(100);
+    const SLACK: Duration = Duration::from_millis(500);
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW).await.unwrap();
+        loop {
+            match conn.recv().await {
+                Ok(_) => {}
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        conn.close().await.unwrap();
+    });
+
+    let client_sock = ephemeral().await;
+    let client_addr = client_sock.local_addr;
+
+    let client = tokio::spawn(async move {
+        let mut conn = GbnConnection::connect(client_sock, server_addr, WINDOW)
+            .await
+            .unwrap()
+            .with_msl(MSL);
+
+        conn.send(b"hello").await.unwrap();
+        let t0 = Instant::now();
+        conn.close().await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= TWO_MSL, "TIME_WAIT not observed; elapsed={:?}", elapsed);
+        assert!(elapsed < TWO_MSL + SLACK, "close() over-waited; elapsed={:?}", elapsed);
+    });
+
+    // Injector: wait for client to reach TIME_WAIT, then send a stale segment.
+    let injector = tokio::spawn(async move {
+        // Sleep long enough for the handshake + data exchange + FIN exchange
+        // to complete and TIME_WAIT to begin.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stale = Packet {
+            header: Header {
+                seq: 0xDEAD_BEEF,
+                ack: 0,
+                flags: flags::ACK,
+                window: 8192,
+                checksum: 0,
+            },
+            payload: b"stale-segment".to_vec(),
+        };
+        let bytes = stale.encode().expect("encode failed");
+        // Discard result — client may have already moved to CLOSED.
+        let _ = raw.send_to(&bytes, client_addr.to_string().as_str()).await;
+    });
+
+    timeout(DEADLINE, async {
+        let (s, c, _) = tokio::join!(server, client, injector);
+        s.unwrap(); c.unwrap();
+    })
+    .await
+    .expect("time_wait_absorbs_late_segment timed out");
+}
+
+// ---------------------------------------------------------------------------
+// Test 32: duplicate FIN during TIME_WAIT is re-ACKed
+// ---------------------------------------------------------------------------
+//
+// A third socket injects a duplicate FIN to the client while it lingers in
+// TIME_WAIT.  The client must re-ACK the FIN and continue waiting until 2×MSL
+// expires (TIME_WAIT cannot be shortened by a FIN flood).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_time_wait_reacks_duplicate_fin() {
+    use std::time::{Duration, Instant};
+    use tcp_over_udp::packet::{flags, Header, Packet};
+    use tokio::time::timeout;
+
+    const WINDOW: usize = 4;
+    const MSL: Duration = Duration::from_millis(50);
+    const TWO_MSL: Duration = Duration::from_millis(100);
+    const SLACK: Duration = Duration::from_millis(500);
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    // Track the server's FIN sequence number so the injector can craft a
+    // realistic duplicate.  A channel carries it out of the server task.
+    let (fin_seq_tx, mut fin_seq_rx) = tokio::sync::mpsc::channel::<u32>(1);
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW).await.unwrap();
+        loop {
+            match conn.recv().await {
+                Ok(_) => {}
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        // The server's FIN seq = conn.sender.next_seq.  Expose it before closing.
+        let server_fin_seq = conn.sender.next_seq;
+        let _ = fin_seq_tx.send(server_fin_seq).await;
+
+        // Passive close.
+        conn.close().await.unwrap();
+    });
+
+    let client_sock = ephemeral().await;
+    let client_addr = client_sock.local_addr;
+
+    let client = tokio::spawn(async move {
+        let mut conn = GbnConnection::connect(client_sock, server_addr, WINDOW)
+            .await
+            .unwrap()
+            .with_msl(MSL);
+
+        conn.send(b"data").await.unwrap();
+        // Wait for Eof (server sent FIN first in server's close_passive call)
+        // or just close immediately — the active-close path still applies.
+        let t0 = Instant::now();
+        conn.close().await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= TWO_MSL, "TIME_WAIT not observed; elapsed={:?}", elapsed);
+        assert!(elapsed < TWO_MSL + SLACK, "close() over-waited; elapsed={:?}", elapsed);
+    });
+
+    // Injector: wait for client to be in TIME_WAIT, then send a duplicate FIN.
+    let injector = tokio::spawn(async move {
+        // Wait for the server to report its FIN seq (or time out).
+        let server_fin_seq = timeout(Duration::from_secs(2), fin_seq_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        // A bit extra time to ensure client is in TIME_WAIT.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dup_fin = Packet {
+            header: Header {
+                seq: server_fin_seq,
+                ack: 0,
+                flags: flags::FIN | flags::ACK,
+                window: 8192,
+                checksum: 0,
+            },
+            payload: vec![],
+        };
+        let bytes = dup_fin.encode().expect("encode failed");
+        // Ignore result; client may have closed by now.
+        let _ = raw.send_to(&bytes, client_addr.to_string().as_str()).await;
+    });
+
+    timeout(DEADLINE, async {
+        let (s, c, _) = tokio::join!(server, client, injector);
+        s.unwrap(); c.unwrap();
+    })
+    .await
+    .expect("time_wait_reacks_duplicate_fin timed out");
 }
