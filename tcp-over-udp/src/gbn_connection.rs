@@ -60,6 +60,7 @@ use crate::connection::{ConnError, Connection};
 use crate::gbn_receiver::GbnReceiver;
 use crate::gbn_sender::{AckResult, GbnSender};
 use crate::packet::{flags, Header, Packet};
+use crate::persist_timer::PersistTransition;
 use crate::rtt::RttEstimator;
 use crate::socket::Socket;
 use crate::state::ConnectionState;
@@ -244,7 +245,14 @@ impl GbnConnection {
 
         // Wait until the window has room, processing inbound packets meanwhile.
         while !self.sender.can_send() {
-            let sleep = tokio::time::sleep(rto);
+            // Persist timer drives the sleep when stalled on rwnd==0;
+            // the retransmit RTO governs in all other cases.
+            let timeout = if self.sender.persist.is_active() {
+                self.sender.persist.interval()
+            } else {
+                rto
+            };
+            let sleep = tokio::time::sleep(timeout);
             tokio::pin!(sleep);
 
             tokio::select! {
@@ -257,29 +265,36 @@ impl GbnConnection {
                                 rto = self.rtt.rto();
                                 retries = 0;
                             }
+                            // persist state is updated inside process_incoming
+                            // (via update_peer_rwnd); no extra work needed here.
                         }
                         Err(e) => return Err(e),
                     }
                 }
                 _ = &mut sleep => {
-                    retries += 1;
-                    if retries > MAX_RETRIES {
-                        return Err(ConnError::MaxRetriesExceeded);
-                    }
-                    if self.sender.peer_rwnd() == 0 {
+                    if self.sender.persist.is_active() {
                         // Flow-control stall: probe without CC penalty.
+                        // Persist probes do NOT count against retries.
                         self.probe_zero_window().await?;
-                        rto = (rto * 2).min(Duration::from_secs(64));
-                        log::debug!("[gbn] zero-window probe — rto={:?}", rto);
+                        self.sender.persist.on_probe_sent();
+                        log::debug!(
+                            "[gbn] persist probe #{} next={:?}",
+                            self.sender.persist.probe_count(),
+                            self.sender.persist.interval()
+                        );
                     } else {
                         // Selective Repeat: retransmit only the oldest segment.
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            return Err(ConnError::MaxRetriesExceeded);
+                        }
                         self.retransmit_oldest_pkt().await?;
                         self.sender.on_timeout_cc();
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] SR timeout — back-off rto={:?} cwnd={} ssthresh={}",
-                            rto, self.sender.cwnd(), self.sender.ssthresh()
+                            "[gbn] SR timeout #{} — rto={:?} cwnd={} ssthresh={}",
+                            retries, rto, self.sender.cwnd(), self.sender.ssthresh()
                         );
                     }
                 }
@@ -383,7 +398,13 @@ impl GbnConnection {
         let mut retries = 0u32;
 
         while self.sender.has_unacked() {
-            let sleep = tokio::time::sleep(rto);
+            // Use persist interval when stalled on rwnd==0; RTO otherwise.
+            let timeout = if self.sender.persist.is_active() {
+                self.sender.persist.interval()
+            } else {
+                rto
+            };
+            let sleep = tokio::time::sleep(timeout);
             tokio::pin!(sleep);
 
             tokio::select! {
@@ -401,23 +422,29 @@ impl GbnConnection {
                     }
                 }
                 _ = &mut sleep => {
-                    retries += 1;
-                    if retries > MAX_RETRIES {
-                        return Err(ConnError::MaxRetriesExceeded);
-                    }
-                    if self.sender.peer_rwnd() == 0 {
+                    if self.sender.persist.is_active() {
+                        // Flow-control stall: probe without CC penalty.
+                        // Persist probes do NOT count against retries.
                         self.probe_zero_window().await?;
-                        rto = (rto * 2).min(Duration::from_secs(64));
-                        log::debug!("[gbn] flush zero-window probe — rto={:?}", rto);
+                        self.sender.persist.on_probe_sent();
+                        log::debug!(
+                            "[gbn] flush persist probe #{} next={:?}",
+                            self.sender.persist.probe_count(),
+                            self.sender.persist.interval()
+                        );
                     } else {
                         // Selective Repeat: retransmit only the oldest segment.
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            return Err(ConnError::MaxRetriesExceeded);
+                        }
                         self.retransmit_oldest_pkt().await?;
                         self.sender.on_timeout_cc();
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] SR flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
-                            rto, self.sender.cwnd(), self.sender.ssthresh()
+                            "[gbn] SR flush timeout #{} — rto={:?} cwnd={} ssthresh={}",
+                            retries, rto, self.sender.cwnd(), self.sender.ssthresh()
                         );
                     }
                 }
@@ -601,7 +628,8 @@ impl GbnConnection {
         let AckResult { acked_count, rtt_sample, dup_ack: _ } = self.sender.on_ack(ack_num);
         // Always update the peer's advertised receive window, even for dup-ACKs,
         // because the window field in the ACK reflects the peer's current buffer.
-        self.sender.update_peer_rwnd(peer_rwnd);
+        // PersistTransition is managed by callers that own the timer futures.
+        let _ = self.sender.update_peer_rwnd(peer_rwnd);
         if let Some(sample) = rtt_sample {
             self.rtt.record_sample(sample);
             log::debug!(
@@ -957,9 +985,20 @@ async fn event_loop(
     let mut retries = 0u32;
 
     let far_future = Duration::from_secs(365 * 24 * 3600);
-    let timer = tokio::time::sleep(far_future);
-    tokio::pin!(timer);
-    let mut timer_armed = false;
+
+    // ── Retransmit timer ─────────────────────────────────────────────────────
+    // Fires when the oldest in-flight segment exceeds RTO.  Only armed when
+    // there is unacked data AND the peer window is open (persist not active).
+    let retransmit_tmr = tokio::time::sleep(far_future);
+    tokio::pin!(retransmit_tmr);
+    let mut retransmit_armed = false;
+
+    // ── Persist timer ─────────────────────────────────────────────────────────
+    // Fires when peer_rwnd == 0 to send a probe and elicit a window update.
+    // Only active while sender.persist.is_active() — the bool lives inside the
+    // sender so that ACK processing can flip it atomically with peer_rwnd.
+    let persist_tmr = tokio::time::sleep(far_future);
+    tokio::pin!(persist_tmr);
 
     // One-slot staging buffer: holds a segment taken from app_rx when the
     // send window was shut.  Cleared by the drain phase each iteration.
@@ -1002,18 +1041,23 @@ async fn event_loop(
                 }
                 sender.record_sent(pkt);
                 retries = 0;
-                if !timer_armed {
-                    timer.as_mut().reset(tok_now() + rto);
-                    timer_armed = true;
+                // Arm retransmit timer (persist cannot be active when can_send is true).
+                if !retransmit_armed {
+                    retransmit_tmr.as_mut().reset(tok_now() + rto);
+                    retransmit_armed = true;
                 }
                 log::debug!("[gbn:loop] staged → DATA in_flight={}", sender.in_flight());
             } else {
-                // Window still shut — put the segment back and ensure the
-                // retransmit timer is armed so Branch 3 can probe.
+                // Window still shut — put the segment back.
+                // Arm whichever timer is relevant for the stall cause.
                 staged = Some(data);
-                if !timer_armed {
-                    timer.as_mut().reset(tok_now() + rto);
-                    timer_armed = true;
+                if sender.persist.is_active() {
+                    // Zero-window stall: the persist timer drives probing.
+                    persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                } else if !retransmit_armed {
+                    // Congestion/count stall: retransmit timer handles it.
+                    retransmit_tmr.as_mut().reset(tok_now() + rto);
+                    retransmit_armed = true;
                 }
             }
         }
@@ -1055,19 +1099,21 @@ async fn event_loop(
                             }
                             sender.record_sent(pkt);
                             retries = 0;
-                            if !timer_armed {
-                                timer.as_mut().reset(tok_now() + rto);
-                                timer_armed = true;
+                            // Arm retransmit timer (persist cannot be active when can_send is true).
+                            if !retransmit_armed {
+                                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                retransmit_armed = true;
                             }
                             log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
                         } else {
                             // Slow path: window shut — park the segment.
-                            // The drain phase will send it once an ACK opens
-                            // the window; the timer ensures we probe if stalled.
+                            // Arm whichever timer is relevant for the stall cause.
                             staged = Some(payload);
-                            if !timer_armed {
-                                timer.as_mut().reset(tok_now() + rto);
-                                timer_armed = true;
+                            if sender.persist.is_active() {
+                                persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                            } else if !retransmit_armed {
+                                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                retransmit_armed = true;
                             }
                         }
                     }
@@ -1129,7 +1175,35 @@ async fn event_loop(
                         fin_acked = true;
                         log::debug!("[gbn:loop] ← ACK of our FIN → FIN_WAIT_2");
                     }
-                    sender.update_peer_rwnd(h.window);
+                    // Update peer rwnd and handle persist timer transitions.
+                    let persist_transition = sender.update_peer_rwnd(h.window);
+                    match persist_transition {
+                        PersistTransition::Activated => {
+                            // peer_rwnd just dropped to 0: stop retransmit, start persist.
+                            retransmit_armed = false;
+                            retransmit_tmr.as_mut().reset(tok_now() + far_future);
+                            persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                            log::debug!(
+                                "[gbn:loop] peer_rwnd=0 → persist armed interval={:?}",
+                                sender.persist.interval()
+                            );
+                        }
+                        PersistTransition::Deactivated => {
+                            // peer_rwnd reopened (possibly mid-backoff): stop persist,
+                            // re-arm retransmit if there is still unacked data.
+                            persist_tmr.as_mut().reset(tok_now() + far_future);
+                            if sender.has_unacked() {
+                                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                retransmit_armed = true;
+                            }
+                            log::debug!(
+                                "[gbn:loop] peer_rwnd>0 → persist disarmed; retransmit re-armed={}",
+                                sender.has_unacked()
+                            );
+                        }
+                        PersistTransition::Unchanged => {}
+                    }
+
                     if let Some(sample) = rtt_sample {
                         rtt.record_sample(sample);
                         log::debug!(
@@ -1147,11 +1221,13 @@ async fn event_loop(
                             h.ack, acked_count, rto, sender.cwnd(), sender.ssthresh(), sender.peer_rwnd()
                         );
 
-                        if sender.has_unacked() {
-                            timer.as_mut().reset(tok_now() + rto);
-                        } else {
-                            timer_armed = false;
-                            timer.as_mut().reset(tok_now() + far_future);
+                        // Update retransmit timer state (persist transition already handled above).
+                        if sender.has_unacked() && !sender.persist.is_active() {
+                            retransmit_tmr.as_mut().reset(tok_now() + rto);
+                            retransmit_armed = true;
+                        } else if !sender.has_unacked() {
+                            retransmit_armed = false;
+                            retransmit_tmr.as_mut().reset(tok_now() + far_future);
                         }
                         // The drain phase at the top of the next iteration will
                         // send any staged segment and/or emit FIN if warranted.
@@ -1189,44 +1265,54 @@ async fn event_loop(
                 }
             }
 
-            // ── Branch 3: retransmit timeout ─────────────────────────────
-            _ = &mut timer, if timer_armed => {
+            // ── Branch 3: SR retransmit timeout ──────────────────────────
+            //
+            // Only fires when there is unacked data AND the peer window is
+            // open.  Persist stalls are handled exclusively by Branch 4.
+            _ = &mut retransmit_tmr, if retransmit_armed => {
                 retries += 1;
                 if retries > MAX_RETRIES {
                     let _ = app_tx.send(Err(ConnError::MaxRetriesExceeded)).await;
                     break;
                 }
-
-                if sender.peer_rwnd() == 0 {
-                    // Flow-control stall: probe the peer for an rwnd update.
-                    if let Some(pkt) = sender.window_entries().next().map(|e| e.packet.clone()) {
-                        log::debug!("[gbn:loop] zero-window probe seq={}", pkt.header.seq);
-                        let _ = socket.send_to(&pkt, peer).await;
-                    } else {
-                        // No in-flight segments (e.g. staged data waiting for
-                        // rwnd > 0): send a pure ACK to elicit a window update.
-                        let ack = build_ack(&sender, &receiver);
-                        log::debug!("[gbn:loop] zero-window keepalive (no in-flight)");
-                        let _ = socket.send_to(&ack, peer).await;
-                    }
-                    rto = (rto * 2).min(Duration::from_secs(64));
-                    log::debug!("[gbn:loop] zero-window probe — rto={:?}", rto);
-                } else {
-                    // Selective Repeat: retransmit only the oldest unacked segment.
-                    if let Some(pkt) = sender.retransmit_oldest() {
-                        log::debug!("[gbn:loop] SR timeout — retransmit oldest seq={}", pkt.header.seq);
-                        let _ = socket.send_to(&pkt, peer).await;
-                    }
-
-                    sender.on_timeout_cc();
-                    rtt.back_off();
-                    rto = rtt.rto();
-                    log::debug!(
-                        "[gbn:loop] SR timeout → SS rto={:?} cwnd={} ssthresh={}",
-                        rto, sender.cwnd(), sender.ssthresh()
-                    );
+                // Selective Repeat: retransmit only the oldest unacked segment.
+                if let Some(pkt) = sender.retransmit_oldest() {
+                    log::debug!("[gbn:loop] SR timeout — retransmit oldest seq={}", pkt.header.seq);
+                    let _ = socket.send_to(&pkt, peer).await;
                 }
-                timer.as_mut().reset(tok_now() + rto);
+                sender.on_timeout_cc();
+                rtt.back_off();
+                rto = rtt.rto();
+                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                log::debug!(
+                    "[gbn:loop] SR timeout #{} rto={:?} cwnd={} ssthresh={}",
+                    retries, rto, sender.cwnd(), sender.ssthresh()
+                );
+            }
+
+            // ── Branch 4: persist probe (zero-window stall) ───────────────
+            //
+            // Fires only while sender.persist.is_active() (peer_rwnd == 0).
+            // Probes do NOT increment tx_count (Karn's algorithm unaffected),
+            // do NOT trigger CC penalties, and do NOT count against retries.
+            _ = &mut persist_tmr, if sender.persist.is_active() => {
+                if let Some(pkt) = sender.window_entries().next().map(|e| e.packet.clone()) {
+                    // Re-send the oldest in-flight segment as the probe.
+                    log::debug!("[gbn:loop] persist probe seq={}", pkt.header.seq);
+                    let _ = socket.send_to(&pkt, peer).await;
+                } else {
+                    // No in-flight segments (staged data blocked on rwnd==0):
+                    // send a pure ACK to elicit a window update from the peer.
+                    let ack = build_ack(&sender, &receiver);
+                    log::debug!("[gbn:loop] persist keepalive (no in-flight)");
+                    let _ = socket.send_to(&ack, peer).await;
+                }
+                sender.persist.on_probe_sent();
+                persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                log::debug!(
+                    "[gbn:loop] persist probe #{} next={:?}",
+                    sender.persist.probe_count(), sender.persist.interval()
+                );
             }
         }
     }

@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::packet::{flags, Header, Packet};
+use crate::persist_timer::{PersistTimer, PersistTransition};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -187,6 +188,27 @@ pub struct GbnSender {
     /// Incremented by `acked_count` on every ACK; when it reaches `cwnd`,
     /// `cwnd` is increased by 1 and the counter resets.
     cwnd_ca_counter: usize,
+
+    // ── Persist timer ────────────────────────────────────────────────────
+
+    /// RFC 793 persist timer state — active only while `peer_rwnd == 0`.
+    ///
+    /// The actual `tokio::time::Sleep` future lives in the connection layer;
+    /// this struct owns the activation state and back-off interval so that the
+    /// connection can arm/disarm the tokio timer in response to [`PersistTransition`]
+    /// values returned by [`update_peer_rwnd`].
+    ///
+    /// [`update_peer_rwnd`]: Self::update_peer_rwnd
+    pub persist: PersistTimer,
+
+    /// Cumulative count of SR retransmissions (i.e. calls to
+    /// [`retransmit_oldest`] that found a segment to retransmit).
+    ///
+    /// Used by tests to verify that the persist timer, not the retransmit
+    /// timer, handled a flow-control stall.
+    ///
+    /// [`retransmit_oldest`]: Self::retransmit_oldest
+    sr_retransmit_count: u64,
 }
 
 impl GbnSender {
@@ -210,6 +232,8 @@ impl GbnSender {
             cc_state: CongestionState::SlowStart,
             dup_ack_count: 0,
             cwnd_ca_counter: 0,
+            persist: PersistTimer::new(),
+            sr_retransmit_count: 0,
         }
     }
 
@@ -485,10 +509,17 @@ impl GbnSender {
         if let Some(entry) = self.window.front_mut() {
             entry.tx_count += 1;
             entry.sent_at = Instant::now();
+            self.sr_retransmit_count += 1;
             Some(entry.packet.clone())
         } else {
             None
         }
+    }
+
+    /// Cumulative number of SR retransmissions (segments re-sent by the
+    /// retransmit timer path).  Does **not** include persist probes.
+    pub fn sr_retransmit_count(&self) -> u64 {
+        self.sr_retransmit_count
     }
 
     /// Increment the transmission count and refresh `sent_at` for every
@@ -519,9 +550,16 @@ impl GbnSender {
     ///
     /// Call this every time an ACK arrives — the ACK's `window` field carries
     /// the peer's current free buffer space in bytes.
-    pub fn update_peer_rwnd(&mut self, rwnd: u16) {
+    ///
+    /// Returns a [`PersistTransition`] indicating whether the persist timer
+    /// should be armed (`Activated`), disarmed (`Deactivated`), or left
+    /// unchanged.  The connection layer uses this to manage the underlying
+    /// `tokio::time::Sleep` futures.
+    pub fn update_peer_rwnd(&mut self, rwnd: u16) -> PersistTransition {
         self.peer_rwnd = rwnd as usize;
-        log::trace!("[sender] peer_rwnd updated to {}", self.peer_rwnd);
+        let t = self.persist.on_rwnd_update(self.peer_rwnd);
+        log::trace!("[sender] peer_rwnd={} persist_transition={:?}", self.peer_rwnd, t);
+        t
     }
 
     /// Peer's current advertised receive window in bytes.

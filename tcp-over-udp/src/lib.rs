@@ -39,6 +39,7 @@ pub mod gbn_connection;
 pub mod gbn_receiver;
 pub mod gbn_sender;
 pub mod packet;
+pub mod persist_timer;
 pub mod receiver;
 pub mod rtt;
 pub mod sender;
