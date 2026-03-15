@@ -10,9 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use gossip_membership::anti_entropy;
 use gossip_membership::gossip;
 use gossip_membership::membership::MembershipTable;
-use gossip_membership::message::{
-    build_gossip, build_ping, status, Message, WireNodeEntry,
-};
+use gossip_membership::message::{build_gossip, build_ping, status, Message, WireNodeEntry};
 use gossip_membership::node::{NodeState, NodeStatus};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -143,55 +141,39 @@ fn bench_encode_decode(c: &mut Criterion) {
 fn bench_gossip_round(c: &mut Criterion) {
     let mut group = c.benchmark_group("gossip_round");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("build_gossip_message", n),
-            &n,
-            |b, &n| {
-                let table = table_with_peers(n);
-                let fanout = gossip::effective_fanout(50, table.entries.len(), true);
-                b.iter(|| {
-                    black_box(gossip::build_gossip_message(
-                        black_box(&table),
-                        1,
-                        42,
-                        0,
-                        fanout,
-                    ));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("build_gossip_message", n), &n, |b, &n| {
+            let table = table_with_peers(n);
+            let fanout = gossip::effective_fanout(50, table.entries.len(), true);
+            b.iter(|| {
+                black_box(gossip::build_gossip_message(
+                    black_box(&table),
+                    1,
+                    42,
+                    0,
+                    fanout,
+                ));
+            });
+        });
     }
     group.finish();
 
     let mut group = c.benchmark_group("gossip_peer_selection");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("pick_gossip_targets", n),
-            &n,
-            |b, &n| {
-                let table = table_with_peers(n);
-                let max = gossip::effective_gossip_targets(1, table.entries.len(), true);
-                b.iter(|| {
-                    black_box(gossip::pick_gossip_targets(
-                        black_box(&table),
-                        1,
-                        max,
-                    ));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("pick_gossip_targets", n), &n, |b, &n| {
+            let table = table_with_peers(n);
+            let max = gossip::effective_gossip_targets(1, table.entries.len(), true);
+            b.iter(|| {
+                black_box(gossip::pick_gossip_targets(black_box(&table), 1, max));
+            });
+        });
     }
     group.finish();
 
     let mut group = c.benchmark_group("gossip_fanout_calc");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("effective_fanout", n),
-            &n,
-            |b, &n| {
-                b.iter(|| black_box(gossip::effective_fanout(50, black_box(n), true)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("effective_fanout", n), &n, |b, &n| {
+            b.iter(|| black_box(gossip::effective_fanout(50, black_box(n), true)));
+        });
     }
     group.finish();
 }
@@ -220,13 +202,7 @@ fn bench_anti_entropy(c: &mut Criterion) {
             &entries,
             |b, entries| {
                 b.iter(|| {
-                    black_box(anti_entropy::build_chunks(
-                        black_box(entries),
-                        1,
-                        42,
-                        0,
-                        1,
-                    ));
+                    black_box(anti_entropy::build_chunks(black_box(entries), 1, 42, 0, 1));
                 });
             },
         );
@@ -270,6 +246,120 @@ fn bench_gossip_digest(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Compression Benchmarks ─────────────────────────────────────────────────────
+
+fn bench_compression(c: &mut Criterion) {
+    use gossip_membership::compression::{CompressionAlgo, Compressor};
+
+    // Test with different payload sizes
+    let compress_sizes: &[usize] = &[10, 50, 100, 500];
+
+    // Small payload (no compression expected)
+    let small_data = b"This is a small test message!".to_vec();
+
+    // Large payload (should compress well)
+    let large_data: Vec<u8> = (0..1000_u32).flat_map(|i| i.to_be_bytes()).collect();
+
+    let mut group = c.benchmark_group("compression_small");
+    group.bench_function("compress", |b| {
+        let compressor = Compressor::new(CompressionAlgo::Lz4);
+        b.iter(|| black_box(compressor.compress(&small_data)));
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("compression_large");
+    group.bench_function("compress", |b| {
+        let compressor = Compressor::new(CompressionAlgo::Lz4);
+        b.iter(|| black_box(compressor.compress(&large_data)));
+    });
+    group.finish();
+
+    // Benchmark message encoding with compression (sizes that fit in MTU)
+    let message_sizes: &[usize] = &[10, 25, 40]; // Must fit in 1400 bytes after compression
+
+    let mut group = c.benchmark_group("message_compressed_encode");
+    for &n in message_sizes {
+        let entries = wire_entries(n);
+        let msg = build_gossip(1, 42, 0, entries);
+        let compressed_msg = msg.clone().with_compression(1);
+        let encoded = compressed_msg.encode().unwrap();
+
+        group.throughput(Throughput::Bytes(encoded.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("encode_compressed", n),
+            &compressed_msg,
+            |b, msg| {
+                b.iter(|| black_box(msg.encode().unwrap()));
+            },
+        );
+    }
+    group.finish();
+
+    // Compare compressed vs uncompressed size
+    let mut group = c.benchmark_group("compression_ratio");
+    for &n in message_sizes {
+        let entries = wire_entries(n);
+        let msg = build_gossip(1, 42, 0, entries);
+
+        let uncompressed = msg.clone().encode().unwrap();
+        let compressed = msg.with_compression(1).encode().unwrap();
+
+        let ratio = compressed.len() as f64 / uncompressed.len() as f64;
+        println!(
+            "Payload size {}: {} -> {} bytes (ratio: {:.2})",
+            n,
+            uncompressed.len(),
+            compressed.len(),
+            ratio
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("ratio", n),
+            &(uncompressed.len(), compressed.len()),
+            |b, _| {
+                b.iter(|| black_box(()));
+            },
+        );
+    }
+    group.finish();
+
+    // CPU time comparison
+    let mut group = c.benchmark_group("compression_cpu_vs_bandwidth");
+    for &n in message_sizes {
+        let entries = wire_entries(n);
+        let msg = build_gossip(1, 42, 0, entries);
+
+        // Measure uncompressed
+        let uncompressed_size = msg.encode().unwrap().len();
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let _ = black_box(msg.clone().encode().unwrap());
+        }
+        let uncompressed_us = start.elapsed().as_micros() / 1000;
+
+        // Measure compressed
+        let compressed_msg = msg.with_compression(1);
+        let compressed_size = compressed_msg.encode().unwrap().len();
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let _ = black_box(compressed_msg.encode().unwrap());
+        }
+        let compressed_us = start.elapsed().as_micros() / 1000;
+
+        let bandwidth_saved = uncompressed_size - compressed_size;
+
+        println!(
+            "{} entries: uncompressed={}us, compressed={}us, size_reduction={} bytes ({:.1}% saved)",
+            n,
+            uncompressed_us,
+            compressed_us,
+            bandwidth_saved,
+            (bandwidth_saved as f64 / uncompressed_size as f64) * 100.0
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_merge,
@@ -277,5 +367,6 @@ criterion_group!(
     bench_gossip_round,
     bench_anti_entropy,
     bench_gossip_digest,
+    bench_compression,
 );
 criterion_main!(benches);
