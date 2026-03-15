@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 
+use crate::compression::{CompressionAlgo, Compressor};
 use crate::crypto::{ClusterKey, CryptoError};
 use crate::message::{Message, MessageError};
 use crate::rate_limit::{InboundRateLimiter, RateLimitConfig};
@@ -60,6 +61,8 @@ pub struct Transport {
     rate_limiter: Option<Mutex<InboundRateLimiter>>,
     /// Count of packets dropped by rate limiting (caller reads this).
     pub rate_limited_count: std::sync::atomic::AtomicU64,
+    /// Compression configuration.
+    compressor: Option<Compressor>,
 }
 
 impl Transport {
@@ -74,6 +77,7 @@ impl Transport {
             sim: None,
             rate_limiter: None,
             rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+            compressor: None,
         })
     }
 
@@ -95,6 +99,17 @@ impl Transport {
         self
     }
 
+    /// Enable compression with the specified algorithm.
+    pub fn with_compression(mut self, algo: CompressionAlgo) -> Self {
+        self.compressor = Some(Compressor::new(algo));
+        self
+    }
+
+    /// Returns `true` if compression is enabled.
+    pub fn is_compressed(&self) -> bool {
+        self.compressor.is_some()
+    }
+
     /// Clone the underlying socket handle (cheap — it's an `Arc`).
     pub fn clone_socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
@@ -105,14 +120,38 @@ impl Transport {
         self.key.is_some()
     }
 
-    /// Encode `msg` and transmit to `dest`.
+    /// Encode, optionally compress, and transmit `msg` to `dest`.
     ///
     /// When a cluster key is configured the encoded bytes are encrypted
     /// with ChaCha20-Poly1305 before being sent.  The sender's node ID
     /// is bound as Additional Authenticated Data (AAD).
+    ///
+    /// When compression is enabled and the payload is large enough, the message
+    /// will be compressed before encoding.
     pub async fn send_to(&self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
+        // Optionally compress the message if compressor is configured
+        let msg_to_send = if let Some(ref compressor) = self.compressor {
+            let payload_estimate = match &msg.payload {
+                crate::message::MessagePayload::Gossip(entries)
+                | crate::message::MessagePayload::Ping(entries)
+                | crate::message::MessagePayload::Ack(entries) => {
+                    entries.iter().map(|e| e.wire_len()).sum::<usize>()
+                }
+                _ => 0,
+            };
+
+            // Only compress if payload is large enough (avoid overhead for small messages)
+            if payload_estimate > 256 && compressor.can_compress() {
+                msg.clone().with_compression(compressor.algorithm().as_u8())
+            } else {
+                msg.clone()
+            }
+        } else {
+            msg.clone()
+        };
+
         // Encode first so we have wire bytes for potential reorder buffering.
-        let encoded = msg.encode().map_err(TransportError::Message)?;
+        let encoded = msg_to_send.encode().map_err(TransportError::Message)?;
         let wire_bytes = match &self.key {
             Some(key) => key
                 .encrypt(&encoded, msg.sender_id)
