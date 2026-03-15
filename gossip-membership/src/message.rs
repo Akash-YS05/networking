@@ -31,9 +31,11 @@ pub const OFF_SENDER_ID: usize = 4; // 8 bytes
 pub const OFF_HEARTBEAT: usize = 12; // 4 bytes
 pub const OFF_INCARNATION: usize = 16; // 4 bytes
 pub const OFF_FLAGS: usize = 20;
-pub const OFF_RESERVED: usize = 21; // reserved for future use, keeps header even
-pub const OFF_CHECKSUM: usize = 22; // 2 bytes
-pub const HEADER_LEN: usize = 24;
+pub const OFF_COMPRESSION: usize = 21; // compression algorithm (0=none, 1=lz4)
+pub const OFF_CAPABILITIES: usize = 22; // peer capabilities (for negotiation)
+pub const OFF_RESERVED: usize = 23; // reserved for future use
+pub const OFF_CHECKSUM: usize = 24; // 2 bytes
+pub const HEADER_LEN: usize = 26; // Keep even for checksum compatibility
 
 // ── Message kinds ────────────────────────────────────────────────────────────
 pub mod kind {
@@ -48,6 +50,23 @@ pub mod kind {
 // ── Flags ────────────────────────────────────────────────────────────────────
 pub mod flags {
     pub const REQUEST_ACK: u8 = 0b0000_0001;
+    pub const COMPRESSED: u8 = 0b0000_0010;
+}
+
+// ── Compression ────────────────────────────────────────────────────────────────
+pub mod compression {
+    pub const ALGO_NONE: u8 = 0;
+    pub const ALGO_LZ4: u8 = 1;
+}
+
+// ── Peer Capabilities ────────────────────────────────────────────────────────
+/// Peer capability bits for negotiation.
+/// Sent in message header to indicate supported features.
+pub mod capabilities {
+    /// Peer supports LZ4 compression.
+    pub const LZ4: u8 = 0b0000_0001;
+    /// Peer supports encryption (ChaCha20-Poly1305).
+    pub const ENCRYPTION: u8 = 0b0000_0010;
 }
 
 // ── Status byte values (also used in NodeStatus::to_wire / from_wire) ────────
@@ -184,7 +203,10 @@ impl PingReqPayload {
         let target_id = u64::from_be_bytes(buf[0..8].try_into().ok()?);
         let (addr, addr_len) = decode_addr(&buf[8..])?;
         Some((
-            Self { target_id, target_addr: addr },
+            Self {
+                target_id,
+                target_addr: addr,
+            },
             8 + addr_len,
         ))
     }
@@ -285,7 +307,12 @@ impl AntiEntropyChunkPayload {
         let total_chunks = u16::from_be_bytes(buf[10..12].try_into().ok()?);
         let entries = parse_node_entries(&buf[AE_CHUNK_HEADER..]).ok()?;
         Some((
-            Self { table_version, chunk_index, total_chunks, entries },
+            Self {
+                table_version,
+                chunk_index,
+                total_chunks,
+                entries,
+            },
             buf.len(),
         ))
     }
@@ -321,6 +348,9 @@ pub struct Message {
     pub sender_heartbeat: u32,
     pub sender_incarnation: u32,
     pub flags: u8,
+    pub compression_algo: u8,
+    /// Capabilities supported by the sender (for negotiation).
+    pub peer_capabilities: u8,
     pub payload: MessagePayload,
 }
 
@@ -335,6 +365,46 @@ impl Message {
     pub fn requests_ack(&self) -> bool {
         self.flags & flags::REQUEST_ACK != 0
     }
+
+    /// Set the COMPRESSED flag and compression algorithm.
+    pub fn with_compression(mut self, algo: u8) -> Self {
+        if algo != compression::ALGO_NONE {
+            self.flags |= flags::COMPRESSED;
+            self.compression_algo = algo;
+        }
+        self
+    }
+
+    /// Returns `true` if the COMPRESSED flag is set.
+    pub fn is_compressed(&self) -> bool {
+        self.flags & flags::COMPRESSED != 0
+    }
+
+    /// Returns the compression algorithm (0 = none).
+    pub fn compression_algo(&self) -> u8 {
+        self.compression_algo
+    }
+
+    /// Set peer capabilities (what compression algorithms this node supports).
+    pub fn with_peer_capabilities(mut self, caps: u8) -> Self {
+        self.peer_capabilities = caps;
+        self
+    }
+
+    /// Returns the peer's declared capabilities.
+    pub fn peer_capabilities(&self) -> u8 {
+        self.peer_capabilities
+    }
+
+    /// Check if peer supports LZ4 compression.
+    pub fn peer_supports_lz4(&self) -> bool {
+        self.peer_capabilities & capabilities::LZ4 != 0
+    }
+
+    /// Check if peer supports encryption.
+    pub fn peer_supports_encryption(&self) -> bool {
+        self.peer_capabilities & capabilities::ENCRYPTION != 0
+    }
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -347,6 +417,9 @@ pub enum MessageError {
     UnsupportedVersion(u8),
     MalformedPayload,
     PayloadTooLarge,
+    CompressionFailed,
+    DecompressionFailed,
+    UnsupportedCompression(u8),
 }
 
 impl std::fmt::Display for MessageError {
@@ -359,6 +432,9 @@ impl std::fmt::Display for MessageError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported protocol version {v}"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::PayloadTooLarge => write!(f, "payload too large for UDP MTU"),
+            Self::CompressionFailed => write!(f, "compression failed"),
+            Self::DecompressionFailed => write!(f, "decompression failed"),
+            Self::UnsupportedCompression(v) => write!(f, "unsupported compression algorithm {v}"),
         }
     }
 }
@@ -369,17 +445,43 @@ impl std::error::Error for MessageError {}
 pub fn internet_checksum(buf: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
+    // Handle complete 16-bit words
     while i + 1 < buf.len() {
-        sum += u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]));
+        // Network byte order is big-endian
+        let word = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        sum += u32::from(word);
         i += 2;
     }
+    // Handle leftover byte (if odd length) - pad at HIGH byte position
+    // This is correct for IP/UDP/TCP checksums
     if i < buf.len() {
         sum += u32::from(buf[i]) << 8;
     }
+    // Add carry bits
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+fn compress_payload(data: &[u8], algo: u8) -> Result<Vec<u8>, MessageError> {
+    use lz4_flex::block::compress_prepend_size;
+    match algo {
+        compression::ALGO_NONE => Ok(data.to_vec()),
+        compression::ALGO_LZ4 => Ok(compress_prepend_size(data)),
+        _ => Err(MessageError::UnsupportedCompression(algo)),
+    }
+}
+
+fn decompress_payload(data: &[u8], algo: u8) -> Result<Vec<u8>, MessageError> {
+    use lz4_flex::block::decompress_size_prepended;
+    match algo {
+        compression::ALGO_NONE => Ok(data.to_vec()),
+        compression::ALGO_LZ4 => {
+            decompress_size_prepended(data).map_err(|_| MessageError::DecompressionFailed)
+        }
+        _ => Err(MessageError::UnsupportedCompression(algo)),
+    }
 }
 
 // ── Encode / Decode ───────────────────────────────────────────────────────────
@@ -389,7 +491,9 @@ impl Message {
         // Build payload bytes first so we know the length.
         let mut payload_bytes: Vec<u8> = Vec::new();
         match &self.payload {
-            MessagePayload::Gossip(entries) | MessagePayload::Ping(entries) | MessagePayload::Ack(entries) => {
+            MessagePayload::Gossip(entries)
+            | MessagePayload::Ping(entries)
+            | MessagePayload::Ack(entries) => {
                 encode_node_entries(entries, &mut payload_bytes);
             }
             MessagePayload::PingReq(p) => {
@@ -402,6 +506,14 @@ impl Message {
                 c.encode_into(&mut payload_bytes);
             }
         }
+
+        // Apply compression if requested
+        let payload_bytes = if self.is_compressed() {
+            let compressed = compress_payload(&payload_bytes, self.compression_algo)?;
+            compressed
+        } else {
+            payload_bytes
+        };
 
         let payload_len = payload_bytes.len();
         if payload_len > 1400 {
@@ -416,11 +528,12 @@ impl Message {
         buf[OFF_KIND] = self.kind;
         buf[OFF_PLEN..OFF_PLEN + 2].copy_from_slice(&(payload_len as u16).to_be_bytes());
         buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].copy_from_slice(&self.sender_id.to_be_bytes());
-        buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4]
-            .copy_from_slice(&self.sender_heartbeat.to_be_bytes());
+        buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4].copy_from_slice(&self.sender_heartbeat.to_be_bytes());
         buf[OFF_INCARNATION..OFF_INCARNATION + 4]
             .copy_from_slice(&self.sender_incarnation.to_be_bytes());
         buf[OFF_FLAGS] = self.flags;
+        buf[OFF_COMPRESSION] = self.compression_algo;
+        buf[OFF_CAPABILITIES] = self.peer_capabilities;
         // Checksum field stays zero for computation.
         buf[HEADER_LEN..].copy_from_slice(&payload_bytes);
 
@@ -473,37 +586,39 @@ impl Message {
             u64::from_be_bytes(buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].try_into().unwrap());
         let sender_heartbeat =
             u32::from_be_bytes(buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4].try_into().unwrap());
-        let sender_incarnation =
-            u32::from_be_bytes(buf[OFF_INCARNATION..OFF_INCARNATION + 4].try_into().unwrap());
+        let sender_incarnation = u32::from_be_bytes(
+            buf[OFF_INCARNATION..OFF_INCARNATION + 4]
+                .try_into()
+                .unwrap(),
+        );
         let flags = buf[OFF_FLAGS];
+        let compression_algo = buf[OFF_COMPRESSION];
+        let peer_capabilities = buf[OFF_CAPABILITIES];
 
-        let payload_buf = &buf[HEADER_LEN..];
+        // Check if compressed and decompress if needed
+        let payload_buf = if flags & flags::COMPRESSED != 0 {
+            decompress_payload(&buf[HEADER_LEN..], compression_algo)?
+        } else {
+            buf[HEADER_LEN..].to_vec()
+        };
 
         let payload = match msg_kind {
-            kind::GOSSIP => {
-                MessagePayload::Gossip(parse_node_entries(payload_buf)?)
-            }
-            kind::PING => {
-                MessagePayload::Ping(parse_node_entries(payload_buf)?)
-            }
+            kind::GOSSIP => MessagePayload::Gossip(parse_node_entries(&payload_buf)?),
+            kind::PING => MessagePayload::Ping(parse_node_entries(&payload_buf)?),
             kind::PING_REQ => {
                 let (p, consumed) =
-                    PingReqPayload::decode(payload_buf).ok_or(MessageError::MalformedPayload)?;
-                if consumed != payload_len {
+                    PingReqPayload::decode(&payload_buf).ok_or(MessageError::MalformedPayload)?;
+                if consumed != payload_buf.len() {
                     return Err(MessageError::MalformedPayload);
                 }
                 MessagePayload::PingReq(p)
             }
-            kind::ACK => {
-                MessagePayload::Ack(parse_node_entries(payload_buf)?)
-            }
-            kind::LEAVE => {
-                MessagePayload::Leave
-            }
+            kind::ACK => MessagePayload::Ack(parse_node_entries(&payload_buf)?),
+            kind::LEAVE => MessagePayload::Leave,
             kind::ANTI_ENTROPY => {
-                let (c, consumed) = AntiEntropyChunkPayload::decode(payload_buf)
+                let (c, consumed) = AntiEntropyChunkPayload::decode(&payload_buf)
                     .ok_or(MessageError::MalformedPayload)?;
-                if consumed != payload_len {
+                if consumed != payload_buf.len() {
                     return Err(MessageError::MalformedPayload);
                 }
                 MessagePayload::AntiEntropyChunk(c)
@@ -518,6 +633,8 @@ impl Message {
             sender_heartbeat,
             sender_incarnation,
             flags,
+            compression_algo,
+            peer_capabilities,
             payload,
         })
     }
@@ -537,6 +654,8 @@ pub fn build_gossip(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::Gossip(entries),
     }
 }
@@ -554,6 +673,8 @@ pub fn build_ping(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::Ping(entries),
     }
 }
@@ -572,6 +693,8 @@ pub fn build_ping_req(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::PingReq(PingReqPayload {
             target_id,
             target_addr,
@@ -592,6 +715,8 @@ pub fn build_ack(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::Ack(entries),
     }
 }
@@ -612,6 +737,8 @@ pub fn build_anti_entropy_chunk(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::AntiEntropyChunk(AntiEntropyChunkPayload {
             table_version,
             chunk_index,
@@ -621,11 +748,7 @@ pub fn build_anti_entropy_chunk(
     }
 }
 
-pub fn build_leave(
-    sender_id: u64,
-    sender_heartbeat: u32,
-    sender_incarnation: u32,
-) -> Message {
+pub fn build_leave(sender_id: u64, sender_heartbeat: u32, sender_incarnation: u32) -> Message {
     Message {
         version: VERSION,
         kind: kind::LEAVE,
@@ -633,6 +756,8 @@ pub fn build_leave(
         sender_heartbeat,
         sender_incarnation,
         flags: 0,
+        compression_algo: 0,
+        peer_capabilities: 0,
         payload: MessagePayload::Leave,
     }
 }
@@ -722,7 +847,10 @@ mod tests {
         let entries = vec![v4_entry.clone(), v6_entry.clone()];
         let msg = build_gossip(7, 42, 0, entries.clone());
         let buf = msg.encode().unwrap();
-        assert_eq!(buf.len(), HEADER_LEN + NODE_ENTRY_V4_LEN + NODE_ENTRY_V6_LEN);
+        assert_eq!(
+            buf.len(),
+            HEADER_LEN + NODE_ENTRY_V4_LEN + NODE_ENTRY_V6_LEN
+        );
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
             MessagePayload::Gossip(got) => assert_eq!(got, entries),
@@ -857,13 +985,18 @@ mod tests {
             build_ping(1, 0, 0, vec![]),
             build_ping(u64::MAX, u32::MAX, 0, vec![]),
             build_ack(42, 100, 0, vec![]),
-            build_gossip(7, 3, 0, vec![WireNodeEntry {
-                node_id: 1,
-                heartbeat: 0,
-                incarnation: 0,
-                status: status::ALIVE,
-                addr: v4([127, 0, 0, 1], 9000),
-            }]),
+            build_gossip(
+                7,
+                3,
+                0,
+                vec![WireNodeEntry {
+                    node_id: 1,
+                    heartbeat: 0,
+                    incarnation: 0,
+                    status: status::ALIVE,
+                    addr: v4([127, 0, 0, 1], 9000),
+                }],
+            ),
         ] {
             let buf = msg.encode().unwrap();
             assert!(
@@ -904,8 +1037,7 @@ mod tests {
     fn checksum_all_zero_fields_roundtrip() {
         let msg = build_ping(0, 0, 0, vec![]);
         let buf = msg.encode().unwrap();
-        let stored =
-            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
+        let stored = u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
         assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
         assert!(Message::decode(&buf).is_ok());
     }
@@ -920,15 +1052,6 @@ mod tests {
         assert_eq!(decoded.sender_heartbeat, 42);
         assert_eq!(decoded.sender_incarnation, 3);
         assert!(matches!(decoded.payload, MessagePayload::Leave));
-    }
-
-    // ── Version tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn encode_preserves_version() {
-        let msg = build_ping(1, 0, 0, vec![]);
-        let buf = msg.encode().unwrap();
-        assert_eq!(buf[OFF_VERSION], VERSION);
     }
 
     #[test]
@@ -980,7 +1103,11 @@ mod tests {
             build_leave(1, 0, 0),
         ] {
             let buf = msg.encode().unwrap();
-            assert_eq!(buf[OFF_VERSION], VERSION, "kind={} must encode version", msg.kind);
+            assert_eq!(
+                buf[OFF_VERSION], VERSION,
+                "kind={} must encode version",
+                msg.kind
+            );
             let decoded = Message::decode(&buf).unwrap();
             assert_eq!(decoded.version, VERSION);
         }
